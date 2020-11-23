@@ -203,6 +203,26 @@ void StaticMeshDocument_DrawOverlayButtons(GuiState* state, std::shared_ptr<Docu
         state->FontManager->FontL.Pop();
         ImGui::Separator();
 
+        //If popup is visible then redraw scene each frame. Simpler than trying to add checks for each option changing
+        data->Scene->NeedsRedraw = true;
+
+        if (ImGui::Button("Show all"))
+        {
+            for (u32 i = 0; i < data->StaticMesh.SubMeshes.size(); i++)
+            {
+                RenderObject& renderObj = data->Scene->Objects[data->RenderObjectIndices[i]];
+                renderObj.Visible = true;
+            }
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Hide all"))
+        {
+            for (u32 i = 0; i < data->StaticMesh.SubMeshes.size(); i++)
+            {
+                RenderObject& renderObj = data->Scene->Objects[data->RenderObjectIndices[i]];
+                renderObj.Visible = false;
+            }
+        }
         if (ImGui::BeginChild("##MeshInfoSubmeshesList", ImVec2(200.0f, 150.0f)))
         {
             ImGui::Columns(2);
@@ -530,6 +550,8 @@ void StaticMeshDocument_WorkerThread(GuiState* state, std::shared_ptr<Document> 
         data->StaticMesh.Read(cpuFileReader, data->Filename, 0xC0FFEE11, 5);
     else if (ext == ".ccmesh_pc")
         data->StaticMesh.Read(cpuFileReader, data->Filename, 0xFAC351A9, 4);
+    else if (ext == ".cchk_pc")
+        data->StaticMesh.Read(cpuFileReader, data->Filename, 0x0, 0, true);
 
     Log->info("Mesh vertex format: {}", to_string(data->StaticMesh.VertexBufferConfig.Format));
 
@@ -609,172 +631,357 @@ void StaticMeshDocument_WorkerThread(GuiState* state, std::shared_ptr<Document> 
     }
     state->Renderer->ContextMutex.unlock();
 
-    //Hide all submeshes except first if num submeshes = num lods. Generally the other submeshes are low lod meshes
-    bool hideLowLodMeshes = data->StaticMesh.NumLods == data->StaticMesh.NumSubmeshes;
-
-    //Track list of textures found and not found to avoid repeat searches
-    std::unordered_map<string, Texture2D_Ext> foundTextures = {};
-    std::unordered_map<string, int> missingTextures = {};
-
-    //Two steps for each submesh: Get index/vertex buffers and find textures
-    u32 numSteps = data->StaticMesh.SubMeshes.size() * 2;
-    f32 stepSize = 1.0f / (f32)numSteps;
-
-    for (u32 i = 0; i < data->StaticMesh.SubMeshes.size(); i++)
+    if (ext == ".cchk_pc")
     {
-        data->WorkerStatusString = "Loading submesh " + std::to_string(i) + "...";
+        //Hide all submeshes except first if num submeshes = num lods. Generally the other submeshes are low lod meshes
+        bool hideLowLodMeshes = data->StaticMesh.NumLods == data->StaticMesh.NumSubmeshes;
 
-        //Read index and vertex buffers from gpu file
-        auto maybeMeshData = data->StaticMesh.ReadSubmeshData(gpuFileReader, i);
-        if (!maybeMeshData)
-            THROW_EXCEPTION("Failed to get mesh data for static mesh doc in StaticMesh::ReadSubmeshData()");
+        //Track list of textures found and not found to avoid repeat searches
+        std::unordered_map<string, Texture2D_Ext> foundTextures = {};
+        std::unordered_map<string, int> missingTextures = {};
 
-        state->Renderer->ContextMutex.lock();
-        MeshInstanceData meshData = maybeMeshData.value();
-        auto& renderObject = data->Scene->Objects.emplace_back();
-        data->RenderObjectIndices.push_back(data->Scene->Objects.size() - 1);
-        Mesh mesh;
-        mesh.Create(data->Scene->d3d11Device_, data->Scene->d3d11Context_, meshData.VertexBuffer, meshData.IndexBuffer,
-            data->StaticMesh.VertexBufferConfig.NumVerts, DXGI_FORMAT_R16_UINT, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
-        renderObject.Create(mesh, Vec3{ 0.0f, 0.0f, 0.0f });
-        renderObject.SetScale(25.0f);
-        if (hideLowLodMeshes && i > 0)
-            renderObject.Visible = false;
-        state->Renderer->ContextMutex.unlock();
-        
-        data->WorkerProgressFraction += stepSize;
+        //Two steps for each submesh: Get index/vertex buffers and find textures
+        u32 numSteps = data->StaticMesh.Destroyables[0].subpieces.size() * 2;
+        f32 stepSize = 1.0f / (f32)numSteps;
 
-        //Todo: Better handle materials. This works okay but doesn't always properly apply textures to meshes with multiple submeshes with different materials
-        data->WorkerStatusString = "Locating textures for submesh " + std::to_string(i) + "...";
-        bool foundDiffuse = false;
-        bool foundSpecular = false;
-        bool foundNormal = false;
-        for (auto& textureName : data->StaticMesh.TextureNames)
+        destroyable& dest = data->StaticMesh.Destroyables[0];
+        for (u32 i = 0; i < dest.subpieces.size(); i++)
         {
-            string textureNameLower = String::ToLower(textureName);
-            bool missing = missingTextures.find(textureNameLower) != missingTextures.end();
-            if (missing) //Skip textures that weren't found in previous searches
-                continue;
+            subpiece_base& subpiece = dest.subpieces[i];
+            subpiece_base_data& subpieceData = dest.subpieces_data[i];
 
-            if (!foundDiffuse && String::Contains(textureNameLower, "_d"))
+            data->WorkerStatusString = "Loading submesh " + std::to_string(i) + "...";
+
+            //Read index and vertex buffers from gpu file
+            auto maybeMeshData = data->StaticMesh.ReadSubmeshData(gpuFileReader, subpieceData.render_subpiece, ext == ".cchk_pc");
+            if (!maybeMeshData)
+                THROW_EXCEPTION("Failed to get mesh data for static mesh doc in StaticMesh::ReadSubmeshData()");
+
+            state->Renderer->ContextMutex.lock();
+            MeshInstanceData meshData = maybeMeshData.value();
+            auto& renderObject = data->Scene->Objects.emplace_back();
+            data->RenderObjectIndices.push_back(data->Scene->Objects.size() - 1);
+            Mesh mesh;
+            mesh.Create(data->Scene->d3d11Device_, data->Scene->d3d11Context_, meshData.VertexBuffer, meshData.IndexBuffer,
+                data->StaticMesh.VertexBufferConfig.NumVerts, DXGI_FORMAT_R16_UINT, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+            renderObject.Create(mesh, Vec3{ 0.0f, 0.0f, 0.0f });
+            renderObject.SetScale(1.0f);
+            if (hideLowLodMeshes && i > 0)
+                renderObject.Visible = false;
+
+
+            renderObject.Position.x = subpiece.pos.x;
+            renderObject.Position.y = subpiece.pos.y;
+            renderObject.Position.z = subpiece.pos.z;
+
+
+            state->Renderer->ContextMutex.unlock();
+
+            data->WorkerProgressFraction += stepSize;
+
+            //Todo: Better handle materials. This works okay but doesn't always properly apply textures to meshes with multiple submeshes with different materials
+            data->WorkerStatusString = "Locating textures for submesh " + std::to_string(i) + "...";
+            bool foundDiffuse = false;
+            bool foundSpecular = false;
+            bool foundNormal = false;
+            for (auto& textureName : data->StaticMesh.TextureNames)
             {
-                std::optional<Texture2D_Ext> texture = {};
-                bool notInCache = foundTextures.find(textureNameLower) == foundTextures.end();
-                if (notInCache)
-                    texture = FindTexture(state, doc, textureNameLower, true);
-                else
-                    texture = foundTextures[textureNameLower];
+                string textureNameLower = String::ToLower(textureName);
+                bool missing = missingTextures.find(textureNameLower) != missingTextures.end();
+                if (missing) //Skip textures that weren't found in previous searches
+                    continue;
 
-                if (texture)
+                if (!foundDiffuse && String::Contains(textureNameLower, "_d"))
                 {
+                    std::optional<Texture2D_Ext> texture = {};
+                    bool notInCache = foundTextures.find(textureNameLower) == foundTextures.end();
                     if (notInCache)
-                        Log->info("Found diffuse texture {} for {}", textureNameLower, data->Filename);
+                        texture = FindTexture(state, doc, textureNameLower, true);
                     else
-                        Log->info("Using cached copy of {} for {}", textureNameLower, data->Filename);
+                        texture = foundTextures[textureNameLower];
 
-                    std::lock_guard<std::mutex> lock(state->Renderer->ContextMutex);
-                    renderObject.UseTextures = true;
-                    renderObject.DiffuseTexture = texture.value().Texture;
-                    foundDiffuse = true;
-
-                    //Set diffuse texture used for export as first one found
-                    if (data->DiffuseMapPegPath == "")
+                    if (texture)
                     {
-                        data->DiffuseMapPegPath = texture.value().CpuFilePath;
-                        data->DiffuseTextureName = texture.value().Texture.Name;
-                    }
+                        if (notInCache)
+                            Log->info("Found diffuse texture {} for {}", textureNameLower, data->Filename);
+                        else
+                            Log->info("Using cached copy of {} for {}", textureNameLower, data->Filename);
 
-                    if (foundTextures.find(textureNameLower) == foundTextures.end())
-                        foundTextures[textureNameLower] = texture.value();
+                        std::lock_guard<std::mutex> lock(state->Renderer->ContextMutex);
+                        renderObject.UseTextures = true;
+                        renderObject.DiffuseTexture = texture.value().Texture;
+                        foundDiffuse = true;
+
+                        //Set diffuse texture used for export as first one found
+                        if (data->DiffuseMapPegPath == "")
+                        {
+                            data->DiffuseMapPegPath = texture.value().CpuFilePath;
+                            data->DiffuseTextureName = texture.value().Texture.Name;
+                        }
+
+                        if (foundTextures.find(textureNameLower) == foundTextures.end())
+                            foundTextures[textureNameLower] = texture.value();
+                    }
+                    else
+                    {
+                        missingTextures[textureNameLower] = 0;
+                        Log->warn("Failed to find diffuse texture {} for {}", textureNameLower, data->Filename);
+                    }
                 }
-                else
+                else if (!foundNormal && String::Contains(textureNameLower, "_n"))
                 {
-                    missingTextures[textureNameLower] = 0;
-                    Log->warn("Failed to find diffuse texture {} for {}", textureNameLower, data->Filename);
+                    std::optional<Texture2D_Ext> texture = {};
+                    bool notInCache = foundTextures.find(textureNameLower) == foundTextures.end();
+                    if (notInCache)
+                        texture = FindTexture(state, doc, textureNameLower, true);
+                    else
+                        texture = foundTextures[textureNameLower];
+
+                    if (texture)
+                    {
+                        if (notInCache)
+                            Log->info("Found normal map {} for {}", textureNameLower, data->Filename);
+                        else
+                            Log->info("Using cached copy of {} for {}", textureNameLower, data->Filename);
+
+                        std::lock_guard<std::mutex> lock(state->Renderer->ContextMutex);
+                        renderObject.UseTextures = true;
+                        renderObject.NormalTexture = texture.value().Texture;
+                        foundNormal = true;
+
+                        //Set normal texture used for export as first one found
+                        if (data->NormalMapPegPath == "")
+                        {
+                            data->NormalMapPegPath = texture.value().CpuFilePath;
+                            data->NormalTextureName = texture.value().Texture.Name;
+                        }
+
+                        if (foundTextures.find(textureNameLower) == foundTextures.end())
+                            foundTextures[textureNameLower] = texture.value();
+                    }
+                    else
+                    {
+                        missingTextures[textureNameLower] = 0;
+                        Log->warn("Failed to find normal map {} for {}", textureNameLower, data->Filename);
+                    }
+                }
+                else if (!foundSpecular && String::Contains(textureNameLower, "_s"))
+                {
+                    std::optional<Texture2D_Ext> texture = {};
+                    bool notInCache = foundTextures.find(textureNameLower) == foundTextures.end();
+                    if (notInCache)
+                        texture = FindTexture(state, doc, textureNameLower, true);
+                    else
+                        texture = foundTextures[textureNameLower];
+
+                    if (texture)
+                    {
+                        if (notInCache)
+                            Log->info("Found specular map {} for {}", textureNameLower, data->Filename);
+                        else
+                            Log->info("Using cached copy of {} for {}", textureNameLower, data->Filename);
+
+                        std::lock_guard<std::mutex> lock(state->Renderer->ContextMutex);
+                        renderObject.UseTextures = true;
+                        renderObject.SpecularTexture = texture.value().Texture;
+                        foundSpecular = true;
+
+                        //Set specular texture used for export as first one found
+                        if (data->SpecularMapPegPath == "")
+                        {
+                            data->SpecularMapPegPath = texture.value().CpuFilePath;
+                            data->SpecularTextureName = texture.value().Texture.Name;
+                        }
+
+                        if (foundTextures.find(textureNameLower) == foundTextures.end())
+                            foundTextures[textureNameLower] = texture.value();
+                    }
+                    else
+                    {
+                        missingTextures[textureNameLower] = 0;
+                        Log->warn("Failed to find specular map {} for {}", textureNameLower, data->Filename);
+                    }
                 }
             }
-            else if (!foundNormal && String::Contains(textureNameLower, "_n"))
-            {
-                std::optional<Texture2D_Ext> texture = {};
-                bool notInCache = foundTextures.find(textureNameLower) == foundTextures.end();
-                if (notInCache)
-                    texture = FindTexture(state, doc, textureNameLower, true);
-                else
-                    texture = foundTextures[textureNameLower];
 
-                if (texture)
-                {
-                    if (notInCache)
-                        Log->info("Found normal map {} for {}", textureNameLower, data->Filename);
-                    else
-                        Log->info("Using cached copy of {} for {}", textureNameLower, data->Filename);
+            data->WorkerProgressFraction += stepSize;
 
-                    std::lock_guard<std::mutex> lock(state->Renderer->ContextMutex);
-                    renderObject.UseTextures = true;
-                    renderObject.NormalTexture = texture.value().Texture;
-                    foundNormal = true;
 
-                    //Set normal texture used for export as first one found
-                    if (data->NormalMapPegPath == "")
-                    {
-                        data->NormalMapPegPath = texture.value().CpuFilePath;
-                        data->NormalTextureName = texture.value().Texture.Name;
-                    }
-
-                    if (foundTextures.find(textureNameLower) == foundTextures.end())
-                        foundTextures[textureNameLower] = texture.value();
-                }
-                else
-                {
-                    missingTextures[textureNameLower] = 0;
-                    Log->warn("Failed to find normal map {} for {}", textureNameLower, data->Filename);
-                }
-            }
-            else if (!foundSpecular && String::Contains(textureNameLower, "_s"))
-            {
-                std::optional<Texture2D_Ext> texture = {};
-                bool notInCache = foundTextures.find(textureNameLower) == foundTextures.end();
-                if (notInCache)
-                    texture = FindTexture(state, doc, textureNameLower, true);
-                else
-                    texture = foundTextures[textureNameLower];
-
-                if (texture)
-                {
-                    if (notInCache)
-                        Log->info("Found specular map {} for {}", textureNameLower, data->Filename);
-                    else
-                        Log->info("Using cached copy of {} for {}", textureNameLower, data->Filename);
-
-                    std::lock_guard<std::mutex> lock(state->Renderer->ContextMutex);
-                    renderObject.UseTextures = true;
-                    renderObject.SpecularTexture = texture.value().Texture;
-                    foundSpecular = true;
-
-                    //Set specular texture used for export as first one found
-                    if (data->SpecularMapPegPath == "")
-                    {
-                        data->SpecularMapPegPath = texture.value().CpuFilePath;
-                        data->SpecularTextureName = texture.value().Texture.Name;
-                    }
-
-                    if (foundTextures.find(textureNameLower) == foundTextures.end())
-                        foundTextures[textureNameLower] = texture.value();
-                }
-                else
-                {
-                    missingTextures[textureNameLower] = 0;
-                    Log->warn("Failed to find specular map {} for {}", textureNameLower, data->Filename);
-                }
-            }
+            //Clear mesh data
+            delete[] meshData.IndexBuffer.data();
+            delete[] meshData.VertexBuffer.data();
         }
+    }
+    else
+    {
+        //Hide all submeshes except first if num submeshes = num lods. Generally the other submeshes are low lod meshes
+        bool hideLowLodMeshes = data->StaticMesh.NumLods == data->StaticMesh.NumSubmeshes;
 
-        data->WorkerProgressFraction += stepSize;
+        //Track list of textures found and not found to avoid repeat searches
+        std::unordered_map<string, Texture2D_Ext> foundTextures = {};
+        std::unordered_map<string, int> missingTextures = {};
+
+        //Two steps for each submesh: Get index/vertex buffers and find textures
+        u32 numSteps = data->StaticMesh.SubMeshes.size() * 2;
+        f32 stepSize = 1.0f / (f32)numSteps;
+
+        for (u32 i = 0; i < data->StaticMesh.SubMeshes.size(); i++)
+        {
+            data->WorkerStatusString = "Loading submesh " + std::to_string(i) + "...";
+
+            //Read index and vertex buffers from gpu file
+            auto maybeMeshData = data->StaticMesh.ReadSubmeshData(gpuFileReader, i, ext == ".cchk_pc");
+            if (!maybeMeshData)
+                THROW_EXCEPTION("Failed to get mesh data for static mesh doc in StaticMesh::ReadSubmeshData()");
+
+            state->Renderer->ContextMutex.lock();
+            MeshInstanceData meshData = maybeMeshData.value();
+            auto& renderObject = data->Scene->Objects.emplace_back();
+            data->RenderObjectIndices.push_back(data->Scene->Objects.size() - 1);
+            Mesh mesh;
+            mesh.Create(data->Scene->d3d11Device_, data->Scene->d3d11Context_, meshData.VertexBuffer, meshData.IndexBuffer,
+                data->StaticMesh.VertexBufferConfig.NumVerts, DXGI_FORMAT_R16_UINT, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+            renderObject.Create(mesh, Vec3{ 0.0f, 0.0f, 0.0f });
+            renderObject.SetScale(25.0f);
+            if (hideLowLodMeshes && i > 0)
+                renderObject.Visible = false;
+
+            state->Renderer->ContextMutex.unlock();
+
+            data->WorkerProgressFraction += stepSize;
+
+            //Todo: Better handle materials. This works okay but doesn't always properly apply textures to meshes with multiple submeshes with different materials
+            data->WorkerStatusString = "Locating textures for submesh " + std::to_string(i) + "...";
+            bool foundDiffuse = false;
+            bool foundSpecular = false;
+            bool foundNormal = false;
+            for (auto& textureName : data->StaticMesh.TextureNames)
+            {
+                string textureNameLower = String::ToLower(textureName);
+                bool missing = missingTextures.find(textureNameLower) != missingTextures.end();
+                if (missing) //Skip textures that weren't found in previous searches
+                    continue;
+
+                if (!foundDiffuse && String::Contains(textureNameLower, "_d"))
+                {
+                    std::optional<Texture2D_Ext> texture = {};
+                    bool notInCache = foundTextures.find(textureNameLower) == foundTextures.end();
+                    if (notInCache)
+                        texture = FindTexture(state, doc, textureNameLower, true);
+                    else
+                        texture = foundTextures[textureNameLower];
+
+                    if (texture)
+                    {
+                        if (notInCache)
+                            Log->info("Found diffuse texture {} for {}", textureNameLower, data->Filename);
+                        else
+                            Log->info("Using cached copy of {} for {}", textureNameLower, data->Filename);
+
+                        std::lock_guard<std::mutex> lock(state->Renderer->ContextMutex);
+                        renderObject.UseTextures = true;
+                        renderObject.DiffuseTexture = texture.value().Texture;
+                        foundDiffuse = true;
+
+                        //Set diffuse texture used for export as first one found
+                        if (data->DiffuseMapPegPath == "")
+                        {
+                            data->DiffuseMapPegPath = texture.value().CpuFilePath;
+                            data->DiffuseTextureName = texture.value().Texture.Name;
+                        }
+
+                        if (foundTextures.find(textureNameLower) == foundTextures.end())
+                            foundTextures[textureNameLower] = texture.value();
+                    }
+                    else
+                    {
+                        missingTextures[textureNameLower] = 0;
+                        Log->warn("Failed to find diffuse texture {} for {}", textureNameLower, data->Filename);
+                    }
+                }
+                else if (!foundNormal && String::Contains(textureNameLower, "_n"))
+                {
+                    std::optional<Texture2D_Ext> texture = {};
+                    bool notInCache = foundTextures.find(textureNameLower) == foundTextures.end();
+                    if (notInCache)
+                        texture = FindTexture(state, doc, textureNameLower, true);
+                    else
+                        texture = foundTextures[textureNameLower];
+
+                    if (texture)
+                    {
+                        if (notInCache)
+                            Log->info("Found normal map {} for {}", textureNameLower, data->Filename);
+                        else
+                            Log->info("Using cached copy of {} for {}", textureNameLower, data->Filename);
+
+                        std::lock_guard<std::mutex> lock(state->Renderer->ContextMutex);
+                        renderObject.UseTextures = true;
+                        renderObject.NormalTexture = texture.value().Texture;
+                        foundNormal = true;
+
+                        //Set normal texture used for export as first one found
+                        if (data->NormalMapPegPath == "")
+                        {
+                            data->NormalMapPegPath = texture.value().CpuFilePath;
+                            data->NormalTextureName = texture.value().Texture.Name;
+                        }
+
+                        if (foundTextures.find(textureNameLower) == foundTextures.end())
+                            foundTextures[textureNameLower] = texture.value();
+                    }
+                    else
+                    {
+                        missingTextures[textureNameLower] = 0;
+                        Log->warn("Failed to find normal map {} for {}", textureNameLower, data->Filename);
+                    }
+                }
+                else if (!foundSpecular && String::Contains(textureNameLower, "_s"))
+                {
+                    std::optional<Texture2D_Ext> texture = {};
+                    bool notInCache = foundTextures.find(textureNameLower) == foundTextures.end();
+                    if (notInCache)
+                        texture = FindTexture(state, doc, textureNameLower, true);
+                    else
+                        texture = foundTextures[textureNameLower];
+
+                    if (texture)
+                    {
+                        if (notInCache)
+                            Log->info("Found specular map {} for {}", textureNameLower, data->Filename);
+                        else
+                            Log->info("Using cached copy of {} for {}", textureNameLower, data->Filename);
+
+                        std::lock_guard<std::mutex> lock(state->Renderer->ContextMutex);
+                        renderObject.UseTextures = true;
+                        renderObject.SpecularTexture = texture.value().Texture;
+                        foundSpecular = true;
+
+                        //Set specular texture used for export as first one found
+                        if (data->SpecularMapPegPath == "")
+                        {
+                            data->SpecularMapPegPath = texture.value().CpuFilePath;
+                            data->SpecularTextureName = texture.value().Texture.Name;
+                        }
+
+                        if (foundTextures.find(textureNameLower) == foundTextures.end())
+                            foundTextures[textureNameLower] = texture.value();
+                    }
+                    else
+                    {
+                        missingTextures[textureNameLower] = 0;
+                        Log->warn("Failed to find specular map {} for {}", textureNameLower, data->Filename);
+                    }
+                }
+            }
+
+            data->WorkerProgressFraction += stepSize;
 
 
-        //Clear mesh data
-        delete[] meshData.IndexBuffer.data();
-        delete[] meshData.VertexBuffer.data();
+            //Clear mesh data
+            delete[] meshData.IndexBuffer.data();
+            delete[] meshData.VertexBuffer.data();
+        }
     }
 
     data->WorkerDone = true;
